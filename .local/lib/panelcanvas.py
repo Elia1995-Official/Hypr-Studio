@@ -450,7 +450,9 @@ class CanvasPage(Gtk.Box):
         # properties
         self.props = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["zone"])
         self.props.set_size_request(330, -1)
-        body.append(Gtk.ScrolledWindow(child=self.props, hscrollbar_policy=Gtk.PolicyType.NEVER))
+        # hexpand=False: the entries inside the props are hexpand and would otherwise split the width 50/50 with the canvas
+        body.append(Gtk.ScrolledWindow(child=self.props, hscrollbar_policy=Gtk.PolicyType.NEVER, hexpand=False,
+                                       min_content_width=330, max_content_width=420, propagate_natural_width=True))
 
         self.refresh_names()
 

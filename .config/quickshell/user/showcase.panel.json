@@ -11,7 +11,7 @@
   "card_radius": 22,
   "card_opacity": 0.78,
   "card_border": true,
-  "generated_hash": "65bac1f481c6f1f916f3ae9fb3676262",
+  "generated_hash": "30ef5929948a0eb6c75666f16d28e98a",
   "items": [
     {
       "type": "clock",
@@ -194,8 +194,8 @@
       "align": "left",
       "prefix": "",
       "suffix": "",
-      "x": 438,
-      "y": 140
+      "x": 440,
+      "y": 146
     },
     {
       "type": "script",

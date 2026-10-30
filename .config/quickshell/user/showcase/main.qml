@@ -272,7 +272,7 @@ PanelWindow {
     Text {
         id: s14
         property string out: ""
-        x: 438; y: 140; width: 244; height: 24
+        x: 440; y: 146; width: 244; height: 24
         text: "" + s14.out + ""
         color: Theme.textPrimary
         font.family: Theme.fontFamily
