@@ -19,4 +19,3 @@
 .config/hypr/studio.json
 .config/hypr/binds.lua
 .config/hypr/hyprland.lua
-.config/hypr/autostart.lua

@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.bak
 sync.sh
+.config/hypr/autostart.lua
+.config/quickshell/user/Test*
