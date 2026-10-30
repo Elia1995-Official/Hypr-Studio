@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""HyprGlass live settings: tweak the glass preset with sliders, apply instantly, save to glass.lua."""
+import json
+import os
+import re
+import shutil
+import subprocess
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gtk, Gdk, GLib, Gio
+
+GLASS_LUA = os.path.expanduser("~/.config/hypr/glass.lua")
+PRESET_FILE = os.path.expanduser("~/.config/hypr/glass-gui-presets.json")
+
+# Plugin defaults, only used to position sliders for keys a preset leaves unset.
+PLUGIN_DEFAULTS = {
+    "blur_strength": 2.0, "blur_iterations": 3, "frost": 0, "frost_blur": 3.0, "noise_strength": 0,
+    "glass_opacity": 1, "edge_height": 0, "edge_thickness_px": 0, "edge_thickness": 0.06,
+    "refraction_strength": 0.6, "refraction_flow": 0, "refraction_spread": 1, "chromatic_aberration": 0.5,
+    "lens_distortion": 0.5, "fresnel_reflection": 0, "fresnel_strength": 0.6, "fresnel_tint": 0,
+    "specular_strength": 0.8, "specular_angle": 0, "bevel_strength": 0, "bevel_size": 6,
+    "bevel_angle": 315, "bevel_tint": 0, "bevel_shadow": 0, "focus_light": 0, "brightness": 1,
+    "contrast": 1, "saturation": 1, "vibrancy": 0, "vibrancy_darkness": 0, "adaptive_dim": 0,
+    "adaptive_boost": 0, "self_sample": 0,
+}
+
+BUILTIN_PRESETS = {
+    "Apple (pomme)": {"inherits": "pomme", "values": {
+        "blur_strength": 1.0, "blur_iterations": 2, "refraction_strength": 2.0, "refraction_flow": 1.0,
+        "chromatic_aberration": 0.0, "fresnel_strength": 0.1, "specular_strength": 0.4,
+        "bevel_strength": 0.5, "bevel_size": 4.0, "bevel_tint": 0.5, "bevel_angle": 315.0,
+        "edge_thickness": 0.024, "edge_thickness_px": 0.0, "edge_height": 0.0, "fresnel_reflection": 0.0,
+        "frost": 0.0, "focus_light": 0.0, "lens_distortion": 0.0, "noise_strength": 0.0,
+        "tint_color": 0x1A1A1A4A, "brightness": 1.1, "contrast": 0.9, "saturation": 1.0, "vibrancy": 0.0}},
+    "Lens edge (old kitty)": {"inherits": "clear", "values": {
+        "blur_strength": 1.2, "blur_iterations": 3, "frost": 1.0, "frost_blur": 3.5, "edge_height": 34,
+        "edge_thickness_px": 22, "fresnel_reflection": 0.45, "refraction_strength": 0.8,
+        "chromatic_aberration": 0.6, "fresnel_strength": 0.5, "specular_strength": 1.0,
+        "specular_angle": 315.0, "bevel_strength": 0.5, "bevel_size": 5.0, "bevel_angle": 315.0,
+        "focus_light": 0.9, "focus_light_color": 0xFFFFFFFF, "tint_color": 0xDDE8FF10, "vibrancy": 0.35,
+        "saturation": 1.15, "brightness": 1.05, "contrast": 1.0, "noise_strength": 0.0}},
+    "Clear pane": {"inherits": "clear", "values": {}},
+    "Subtle": {"inherits": "subtle", "values": {}},
+    "Glass block": {"inherits": "glass", "values": {}},
+}
+
+
+def load_user_presets():
+    try:
+        return json.load(open(PRESET_FILE))
+    except (OSError, ValueError):
+        return {}
+
+
+def store_user_presets(d):
+    json.dump(d, open(PRESET_FILE, "w"), indent=2)
+
+# (key, label, min, max, step, kind) -- kind: float | int | angle
+SECTIONS = [
+    ("Blur & frost", [
+        ("blur_strength", "Blur strength", 0, 6, 0.05, "float"),
+        ("blur_iterations", "Blur iterations", 1, 5, 1, "int"),
+        ("frost", "Frost", 0, 1, 0.01, "float"),
+        ("frost_blur", "Frost blur", 0.5, 10, 0.1, "float"),
+        ("noise_strength", "Noise grain", 0, 1, 0.01, "float"),
+        ("glass_opacity", "Glass opacity", 0, 1, 0.01, "float"),
+    ]),
+    ("Edge & refraction", [
+        ("edge_height", "Edge height (lens px)", 0, 100, 1, "float"),
+        ("edge_thickness_px", "Edge thickness px", 0, 100, 1, "float"),
+        ("edge_thickness", "Edge thickness (relative)", 0, 0.15, 0.005, "float"),
+        ("refraction_strength", "Refraction", 0, 8, 0.05, "float"),
+        ("refraction_flow", "Refraction flow", 0, 1, 0.01, "float"),
+        ("refraction_spread", "Refraction spread", 0, 1, 0.01, "float"),
+        ("chromatic_aberration", "Chromatic aberration", 0, 1, 0.01, "float"),
+        ("lens_distortion", "Lens distortion", 0, 1, 0.01, "float"),
+        ("fresnel_reflection", "Fresnel reflection", 0, 1, 0.01, "float"),
+    ]),
+    ("Highlights", [
+        ("fresnel_strength", "Fresnel glow", 0, 1, 0.01, "float"),
+        ("fresnel_tint", "Fresnel tint", 0, 1, 0.01, "float"),
+        ("specular_strength", "Specular strength", 0, 1, 0.01, "float"),
+        ("specular_angle", "Specular angle", 0, 360, 1, "float"),
+        ("bevel_strength", "Bevel strength", 0, 1, 0.01, "float"),
+        ("bevel_size", "Bevel size", 0, 30, 0.5, "float"),
+        ("bevel_angle", "Bevel angle", 0, 360, 1, "float"),
+        ("bevel_tint", "Bevel tint", 0, 1, 0.01, "float"),
+        ("bevel_shadow", "Bevel shadow", 0, 1, 0.01, "float"),
+        ("focus_light", "Focus light", 0, 1, 0.01, "float"),
+    ]),
+    ("Color", [
+        ("brightness", "Brightness", 0.3, 2, 0.01, "float"),
+        ("contrast", "Contrast", 0.3, 2, 0.01, "float"),
+        ("saturation", "Saturation", 0, 2, 0.01, "float"),
+        ("vibrancy", "Vibrancy", 0, 1, 0.01, "float"),
+        ("vibrancy_darkness", "Vibrancy darkness", 0, 2, 0.01, "float"),
+        ("adaptive_dim", "Adaptive dim", 0, 1, 0.01, "float"),
+        ("adaptive_boost", "Adaptive boost", 0, 1, 0.01, "float"),
+        ("self_sample", "Self sample", 0, 1, 0.01, "float"),
+    ]),
+]
+COLORS = [
+    ("tint_color", "Tint color (alpha = strength)"),
+    ("fresnel_color", "Fresnel color"),
+    ("bevel_color", "Bevel color"),
+    ("focus_light_color", "Focus light color"),
+]
+DEFAULTS = {"tint_color": 0x8899AA22, "fresnel_color": 0xFFFFFF00,
+            "bevel_color": 0xFFFFFF00, "focus_light_color": 0xFFFFFF00}
+
+
+def hypr_eval(code):
+    return subprocess.run(["hyprctl", "eval", code], capture_output=True, text=True).stdout.strip()
+
+
+def find_block(text, preset):
+    """Return (start, end) span of the body of hg.preset("<preset>", { ... })."""
+    m = re.search(r'hg\.preset\(\s*"%s"\s*,\s*\{' % re.escape(preset), text)
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        i += 1
+    return m.end(), i - 1
+
+
+def parse_value(raw):
+    raw = raw.strip().rstrip(",")
+    if raw.startswith('"'):
+        return raw.strip('"')
+    if raw.startswith("0x"):
+        return int(raw, 16)
+    if raw in ("true", "false"):
+        return raw == "true"
+    return float(raw)
+
+
+def load_config():
+    text = open(GLASS_LUA).read()
+    preset = (re.search(r'default_preset\s*=\s*"([^"]+)"', text) or [None, "kitty"])[1]
+    enabled = (re.search(r"enabled\s*=\s*(true|false)", text) or [None, "false"])[1] == "true"
+    vals, inherits = {}, "clear"
+    span = find_block(text, preset)
+    if span:
+        for line in text[span[0]:span[1]].splitlines():
+            m = re.match(r"\s*(\w+)\s*=\s*([^,]+),", line.split("--")[0] + ",")
+            if m:
+                v = parse_value(m.group(2))
+                if m.group(1) == "inherits":
+                    inherits = v
+                else:
+                    vals[m.group(1)] = v
+    return text, preset, enabled, inherits, vals
+
+
+def fmt(key, v):
+    if key in DEFAULTS or isinstance(v, int) and key.endswith("color"):
+        return "0x%08x" % v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if float(v).is_integer():
+        return str(int(v)) if key == "blur_iterations" else "%.1f" % v
+    return ("%.3f" % v).rstrip("0")
+
+
+import sys
+sys.path.insert(0, os.path.expanduser("~/.local/lib"))
+from neonskin import Skin  # shared neon skin (also used by hypr-studio)
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="local.hyprglass.gui")
+        self.timer = None
+        self.widgets = {}
+        self.loading = False
+
+    def do_activate(self):
+        self.skin = Skin()
+        self.text, self.preset, self.enabled, self.inherits, self.vals = load_config()
+        self.orig = dict(self.vals)
+        win = Gtk.ApplicationWindow(application=self, title="HyprGlass", default_width=520, default_height=760)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=10, margin_bottom=10,
+                        margin_start=12, margin_end=12)
+        win.set_child(outer)
+
+        top = Gtk.Box(spacing=10)
+        top.append(Gtk.Label(label="HYPRGLASS  ·  %s" % self.preset, xalign=0, hexpand=True, css_classes=["title-main"]))
+        top.append(Gtk.Label(label="Glass on all windows"))
+        self.sw = Gtk.Switch(active=self.enabled, valign=Gtk.Align.CENTER)
+        self.sw.connect("notify::active", lambda *_: self.push(enabled_only=True))
+        top.append(self.sw)
+        outer.append(top)
+
+        pbar = Gtk.Box(spacing=6)
+        self.names = Gtk.StringList()
+        self.dd = Gtk.DropDown(model=self.names, hexpand=True)
+        pbar.append(self.dd)
+        for label, cb in (("Load", self.preset_load), ("Delete", self.preset_delete)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", cb)
+            pbar.append(b)
+        self.name_entry = Gtk.Entry(placeholder_text="new preset name", width_chars=16)
+        pbar.append(self.name_entry)
+        b = Gtk.Button(label="Save as")
+        b.connect("clicked", self.preset_save_as)
+        pbar.append(b)
+        outer.append(pbar)
+        self.refresh_presets()
+
+        scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        scroll.set_child(body)
+        outer.append(scroll)
+
+        for title, rows in SECTIONS:
+            exp = Gtk.Expander(label=title, expanded=title == SECTIONS[0][0])
+            grid = Gtk.Grid(row_spacing=2, column_spacing=10, margin_top=6)
+            exp.set_child(grid)
+            for r, (key, label, lo, hi, step, kind) in enumerate(rows):
+                grid.attach(Gtk.Label(label=label, xalign=0, width_chars=24), 0, r, 1, 1)
+                cur = float(self.vals.get(key, lo))
+                adj = Gtk.Adjustment(value=cur, lower=lo, upper=hi, step_increment=step)
+                scale = Gtk.Scale(adjustment=adj, hexpand=True, draw_value=False)
+                spin = Gtk.SpinButton(adjustment=adj, digits=0 if kind == "int" else 2, width_chars=6)
+                if kind == "int":
+                    adj.set_step_increment(1)
+                adj.connect("value-changed", self.on_change, key, kind)
+                grid.attach(scale, 1, r, 1, 1)
+                grid.attach(spin, 2, r, 1, 1)
+                self.widgets[key] = adj
+                # keys absent from the file are still sent (at slider default) only once touched
+                if key in self.vals:
+                    pass
+            body.append(exp)
+
+        exp = Gtk.Expander(label="Colors")
+        grid = Gtk.Grid(row_spacing=4, column_spacing=10, margin_top=6)
+        exp.set_child(grid)
+        for r, (key, label) in enumerate(COLORS):
+            grid.attach(Gtk.Label(label=label, xalign=0, hexpand=True), 0, r, 1, 1)
+            v = self.vals.get(key, DEFAULTS[key])
+            rgba = Gdk.RGBA()
+            rgba.red, rgba.green, rgba.blue = (v >> 24 & 255) / 255, (v >> 16 & 255) / 255, (v >> 8 & 255) / 255
+            rgba.alpha = (v & 255) / 255
+            btn = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=True), rgba=rgba)
+            btn.connect("notify::rgba", self.on_color, key)
+            grid.attach(btn, 1, r, 1, 1)
+            self.widgets[key] = btn
+        body.append(exp)
+
+        self.status = Gtk.Label(label="Live: changes apply instantly.", xalign=0, css_classes=["status"])
+        outer.append(self.status)
+        bar = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        for label, cb in (("Revert to file", self.revert), ("Save to glass.lua", self.save)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", cb)
+            bar.append(b)
+        outer.append(bar)
+        win.present()
+
+    # -- state ---------------------------------------------------------
+    def on_change(self, adj, key, kind):
+        if self.loading:
+            return
+        v = adj.get_value()
+        self.vals[key] = int(round(v)) if kind == "int" else round(v, 4)
+        self.schedule()
+
+    def on_color(self, btn, _p, key):
+        if self.loading:
+            return
+        c = btn.get_rgba()
+        self.vals[key] = (round(c.red * 255) << 24 | round(c.green * 255) << 16 |
+                          round(c.blue * 255) << 8 | round(c.alpha * 255))
+        self.schedule()
+
+    def schedule(self):
+        if self.timer:
+            GLib.source_remove(self.timer)
+        self.timer = GLib.timeout_add(40, self.push)
+
+    def push(self, enabled_only=False):
+        self.timer = None
+        if enabled_only:
+            out = hypr_eval("hl.plugin.hyprglass.config({enabled = %s})" % ("true" if self.sw.get_active() else "false"))
+        else:
+            fields = ['inherits = "%s"' % self.inherits] + [
+                "%s = %s" % (k, fmt(k, v)) for k, v in self.vals.items()]
+            out = hypr_eval('hl.plugin.hyprglass.preset("%s", {%s})' % (self.preset, ", ".join(fields)))
+        self.status.set_text("Live: %s" % (out or "ok"))
+        return False
+
+    def apply_values(self, inherits, vals):
+        """Load a preset into the sliders and push it live."""
+        self.loading = True
+        self.inherits, self.vals = inherits, dict(vals)
+        for key, w in self.widgets.items():
+            if isinstance(w, Gtk.Adjustment):
+                w.set_value(float(vals.get(key, PLUGIN_DEFAULTS.get(key, w.get_lower()))))
+            else:
+                v = vals.get(key, DEFAULTS[key])
+                rgba = Gdk.RGBA()
+                rgba.red, rgba.green, rgba.blue = (v >> 24 & 255) / 255, (v >> 16 & 255) / 255, (v >> 8 & 255) / 255
+                rgba.alpha = (v & 255) / 255
+                w.set_rgba(rgba)
+        self.loading = False
+        self.push()
+
+    def all_presets(self):
+        user = load_user_presets()
+        return {**BUILTIN_PRESETS, **user}, user
+
+    def refresh_presets(self, select=None):
+        allp, user = self.all_presets()
+        names = [n for n in allp]
+        self.names.splice(0, self.names.get_n_items(), [("%s *" % n if n in BUILTIN_PRESETS else n) for n in names])
+        self.preset_names = names
+        if select in names:
+            self.dd.set_selected(names.index(select))
+
+    def selected_name(self):
+        i = self.dd.get_selected()
+        return self.preset_names[i] if 0 <= i < len(self.preset_names) else None
+
+    def preset_load(self, *_):
+        name = self.selected_name()
+        if not name:
+            return
+        p = self.all_presets()[0][name]
+        self.apply_values(p["inherits"], p["values"])
+        self.status.set_text("Loaded '%s' (live, not saved to glass.lua)." % name)
+
+    def preset_save_as(self, *_):
+        name = self.name_entry.get_text().strip()
+        if not name or name in BUILTIN_PRESETS:
+            self.status.set_text("Pick a name that isn't a built-in (*) preset.")
+            return
+        user = load_user_presets()
+        user[name] = {"inherits": self.inherits, "values": self.vals}
+        store_user_presets(user)
+        self.refresh_presets(select=name)
+        self.status.set_text("Preset '%s' stored." % name)
+
+    def preset_delete(self, *_):
+        name = self.selected_name()
+        if name in BUILTIN_PRESETS:
+            self.status.set_text("Built-in presets can't be deleted.")
+            return
+        user = load_user_presets()
+        if user.pop(name, None) is not None:
+            store_user_presets(user)
+            self.refresh_presets()
+            self.status.set_text("Deleted '%s'." % name)
+
+    def revert(self, *_):
+        _, _, _, inherits, vals = load_config()
+        subprocess.run(["hyprctl", "reload"], capture_output=True)
+        self.apply_values(inherits, vals)
+        self.status.set_text("Reverted to glass.lua.")
+
+    def save(self, *_):
+        span = find_block(self.text, self.preset)
+        if not span:
+            self.status.set_text("Preset block not found in glass.lua; not saved.")
+            return
+        shutil.copy(GLASS_LUA, GLASS_LUA + ".bak")
+        lines = ['        inherits = "%s",' % self.inherits]
+        lines += ["        %s = %s," % (k, fmt(k, v)) for k, v in self.vals.items()]
+        new = self.text[:span[0]] + "\n" + "\n".join(lines) + "\n    " + self.text[span[1]:]
+        open(GLASS_LUA, "w").write(new)
+        self.text = new
+        self.status.set_text("Saved to glass.lua (backup: glass.lua.bak).")
+
+
+if __name__ == "__main__":
+    App().run()

@@ -1,0 +1,1047 @@
+#!/usr/bin/env python3
+"""Hypr Studio: visual editor for the Quickshell bar/widgets/panels and the Hyprland config.
+
+Pages: Bar (drag & drop module layout), Widgets (templates), Panels (new popup/panel windows),
+Code (editor with live reload + error console), Hyprland (live appearance sliders, keybinds, glass).
+Everything writes plain files that Quickshell / Hyprland pick up on their own:
+  ~/.config/quickshell/layout.json   bar layout + panel list (Quickshell hot-reloads it)
+  ~/.config/quickshell/user/<name>/main.qml   user panels (canvas ones also keep user/<name>.panel.json)
+  ~/.config/hypr/studio.lua          persisted Hyprland tweaks (loaded last by hyprland.lua)
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GtkSource", "5")
+from gi.repository import Gtk, Gdk, GLib, GObject, Gio, GtkSource
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib"))
+from neonskin import Skin  # shared neon skin (same palette as the bar, kitty, hyprglass-gui)
+import panelcanvas  # canvas editor for panels
+
+HOME = os.path.expanduser("~")
+QS = HOME + "/.config/quickshell"
+HYPR = HOME + "/.config/hypr"
+LAYOUT = QS + "/layout.json"
+USER_DIR = QS + "/user"
+STUDIO_LUA = HYPR + "/studio.lua"
+STUDIO_JSON = HYPR + "/studio.json"
+
+ZONES = ("left", "center", "right")
+BUILTIN = {
+    "workspaces": ("󰖲", "Workspaces", "Workspace selector"),
+    "elsewhere": ("󰦟", "Windows elsewhere", "Shows the N-elsewhere chip when windows are on other workspaces"),
+    "mode": ("󰌌", "Mode", "Current keybind mode, hidden when empty"),
+    "start": ("", "START button", "Opens the launcher"),
+    "tray": ("󰀻", "Tray", "System tray icons"),
+    "network": ("󰈀", "Network", "Connection status"),
+    "visualizer": ("󰎆", "Audio visualizer", "Spectrum bars"),
+    "volume": ("", "Volume", "Volume and mute state"),
+    "clock": ("", "Clock", "Date and time, opens the calendar"),
+}
+
+WIDGET_TEMPLATES = [
+    dict(name="Clock (custom format)", icon="", desc="Time in any Qt format, e.g. ddd HH:mm",
+         cfg=dict(type="custom", kind="clock", icon="", format="ddd HH:mm", interval=1, color="accent")),
+    dict(name="CPU temperature", icon="󰔏", desc="Package temperature from lm_sensors",
+         cfg=dict(type="custom", kind="script", icon="󰔏", interval=3, color="accent",
+                  command="sensors 2>/dev/null | awk '/Package id 0/{print $4}' | head -1")),
+    dict(name="CPU load", icon="󰻠", desc="1-minute load average",
+         cfg=dict(type="custom", kind="script", icon="󰻠", interval=3, color="accent",
+                  command="cut -d' ' -f1 /proc/loadavg")),
+    dict(name="RAM used", icon="󰍛", desc="Memory in use",
+         cfg=dict(type="custom", kind="script", icon="󰍛", interval=5, color="accent",
+                  command="free -h | awk '/Mem/{print $3}'")),
+    dict(name="GPU temperature", icon="󰢮", desc="NVIDIA GPU temperature",
+         cfg=dict(type="custom", kind="script", icon="󰢮", interval=4, color="accent",
+                  command="nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader | sed 's/$/°C/'")),
+    dict(name="Disk usage /", icon="󰋊", desc="Root filesystem usage",
+         cfg=dict(type="custom", kind="script", icon="󰋊", interval=60, color="accent",
+                  command="df -h / | awk 'NR==2{print $5}'")),
+    dict(name="Weather", icon="󰖐", desc="Temperature from wttr.in",
+         cfg=dict(type="custom", kind="script", icon="󰖐", interval=900, color="accent",
+                  command="curl -s --max-time 5 'wttr.in?format=%t'")),
+    dict(name="Launcher button", icon="󰐊", desc="A label that starts a command on click",
+         cfg=dict(type="custom", kind="text", icon="", text="Terminal", click="kitty", color="accent", accent=True)),
+    dict(name="Static text / icon", icon="󰉿", desc="Plain label",
+         cfg=dict(type="custom", kind="text", icon="", text="Hello", color="text")),
+    dict(name="Blank script", icon="󰆍", desc="Runs a command and shows its output",
+         cfg=dict(type="custom", kind="script", icon="", command="echo hi", interval=5, color="accent")),
+]
+
+PANEL_TEMPLATES = {
+    "Floating clock card": ("clock-card", '''import QtQuick
+import Quickshell
+import Quickshell.Wayland
+import "../.."
+
+// Desktop clock card, bottom-right. Edit freely: Quickshell reloads this file on save.
+PanelWindow {
+    id: win
+    anchors { bottom: true; right: true }
+    margins { bottom: 40; right: 40 }
+    implicitWidth: 260
+    implicitHeight: 110
+    color: "transparent"
+    exclusionMode: ExclusionMode.Ignore
+    WlrLayershell.layer: WlrLayer.Bottom
+    WlrLayershell.namespace: "studio-clock"
+
+    property string now: Qt.formatDateTime(new Date(), "HH:mm")
+    property string day: Qt.formatDateTime(new Date(), "dddd d MMMM")
+    Timer { interval: 1000; running: true; repeat: true; onTriggered: { win.now = Qt.formatDateTime(new Date(), "HH:mm"); win.day = Qt.formatDateTime(new Date(), "dddd d MMMM") } }
+
+    Rectangle {
+        anchors.fill: parent
+        radius: 22
+        color: Theme.alpha(Theme.panel, 0.78)
+        border.width: 1
+        border.color: Theme.alpha(Theme.neon, 0.55)
+        Column {
+            anchors.centerIn: parent
+            spacing: 2
+            Text { text: win.now; color: Theme.neonStrong; font.family: Theme.fontFamily; font.pixelSize: 44; font.weight: 800; anchors.horizontalCenter: parent.horizontalCenter }
+            Text { text: win.day; color: Theme.textSecondary; font.family: Theme.fontFamily; font.pixelSize: 14; anchors.horizontalCenter: parent.horizontalCenter }
+        }
+    }
+}
+'''),
+    "Side info panel": ("info-panel", '''import QtQuick
+import Quickshell
+import Quickshell.Io
+import Quickshell.Wayland
+import "../.."
+
+// Slim panel on the right edge showing a few live numbers. Add rows to the Repeater model.
+PanelWindow {
+    id: win
+    anchors { top: true; bottom: true; right: true }
+    margins { top: 90; bottom: 90; right: 14 }
+    implicitWidth: 190
+    color: "transparent"
+    exclusionMode: ExclusionMode.Ignore
+    WlrLayershell.layer: WlrLayer.Bottom
+    WlrLayershell.namespace: "studio-info"
+
+    property var rows: [
+        { label: "CPU load", cmd: "cut -d' ' -f1 /proc/loadavg" },
+        { label: "RAM", cmd: "free -h | awk '/Mem/{print $3}'" },
+        { label: "Disk /", cmd: "df -h / | awk 'NR==2{print $5}'" }
+    ]
+
+    Rectangle {
+        anchors.fill: parent
+        radius: 20
+        color: Theme.alpha(Theme.panel, 0.7)
+        border.width: 1
+        border.color: Theme.alpha(Theme.neonDark, 0.7)
+        Column {
+            anchors.fill: parent
+            anchors.margins: 16
+            spacing: 14
+            Repeater {
+                model: win.rows
+                Column {
+                    id: row
+                    required property var modelData
+                    property string value: "…"
+                    spacing: 2
+                    Text { text: row.modelData.label; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                    Text { text: row.value; color: Theme.neonStrong; font.family: Theme.fontFamily; font.pixelSize: 22; font.weight: 800 }
+                    Process { id: p; command: ["sh", "-c", row.modelData.cmd]; stdout: StdioCollector { onStreamFinished: row.value = this.text.trim() } }
+                    Timer { interval: 4000; running: true; repeat: true; triggeredOnStart: true; onTriggered: { p.running = false; p.running = true } }
+                }
+            }
+        }
+    }
+}
+'''),
+    "Popup (toggle by command)": ("popup", '''import QtQuick
+import Quickshell
+import Quickshell.Io
+import Quickshell.Wayland
+import "../.."
+
+// Centered popup. Toggle it from a keybind or a bar widget:
+//   quickshell ipc --path ~/.config/quickshell call studio-popup toggle
+PanelWindow {
+    id: win
+    property bool shown: false
+    visible: shown
+    anchors { top: true; left: true; right: true; bottom: true }
+    color: "transparent"
+    exclusionMode: ExclusionMode.Ignore
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.namespace: "studio-popup"
+    WlrLayershell.keyboardFocus: shown ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.None
+
+    IpcHandler {
+        target: "studio-popup"
+        function toggle(): void { win.shown = !win.shown }
+        function open(): void { win.shown = true }
+        function close(): void { win.shown = false }
+    }
+
+    MouseArea { anchors.fill: parent; onClicked: win.shown = false }
+
+    Rectangle {
+        anchors.centerIn: parent
+        width: 460; height: 260
+        radius: 24
+        color: Theme.alpha(Theme.panel, 0.92)
+        border.width: 1
+        border.color: Theme.alpha(Theme.neon, 0.6)
+        scale: win.shown ? 1 : 0.94
+        Behavior on scale { NumberAnimation { duration: 160; easing.type: Easing.OutBack } }
+        MouseArea { anchors.fill: parent }
+        Text {
+            anchors.centerIn: parent
+            text: "Your popup"
+            color: Theme.neonStrong
+            font.family: Theme.fontFamily
+            font.pixelSize: 26
+            font.weight: 800
+        }
+    }
+}
+'''),
+    "Blank panel": ("panel", '''import QtQuick
+import Quickshell
+import Quickshell.Wayland
+import "../.."
+
+PanelWindow {
+    anchors { top: true; left: true }
+    margins { top: 100; left: 40 }
+    implicitWidth: 240
+    implicitHeight: 120
+    color: "transparent"
+    exclusionMode: ExclusionMode.Ignore
+    WlrLayershell.layer: WlrLayer.Bottom
+    WlrLayershell.namespace: "studio-panel"
+
+    Rectangle {
+        anchors.fill: parent
+        radius: 18
+        color: Theme.alpha(Theme.panel, 0.85)
+        border.width: 1
+        border.color: Theme.alpha(Theme.neon, 0.5)
+        Text { anchors.centerIn: parent; text: "New panel"; color: Theme.textPrimary; font.family: Theme.fontFamily; font.pixelSize: 16 }
+    }
+}
+'''),
+}
+
+# (config path, label, lo, hi, step, kind)
+HYPR_SECTIONS = [
+    ("Layout", [
+        ("general.gaps_in", "Inner gaps", 0, 30, 1, "int"),
+        ("general.gaps_out", "Outer gaps", 0, 60, 1, "int"),
+        ("general.border_size", "Border width", 0, 8, 1, "int"),
+        ("decoration.rounding", "Corner radius", 0, 50, 1, "int"),
+        ("decoration.rounding_power", "Corner squircle power", 2, 6, 0.1, "float"),
+    ]),
+    ("Opacity & shadow", [
+        ("decoration.active_opacity", "Active window opacity", 0.3, 1, 0.01, "float"),
+        ("decoration.inactive_opacity", "Inactive window opacity", 0.3, 1, 0.01, "float"),
+        ("decoration.dim_strength", "Inactive dimming", 0, 0.6, 0.01, "float"),
+        ("decoration.shadow.range", "Shadow size", 0, 80, 1, "int"),
+    ]),
+    ("Blur (everything except HyprGlass windows)", [
+        ("decoration.blur.size", "Blur size", 1, 20, 1, "int"),
+        ("decoration.blur.passes", "Blur passes", 1, 8, 1, "int"),
+        ("decoration.blur.noise", "Noise grain", 0, 0.2, 0.005, "float"),
+        ("decoration.blur.vibrancy", "Vibrancy", 0, 1, 0.01, "float"),
+        ("decoration.blur.brightness", "Brightness", 0.5, 1.5, 0.01, "float"),
+        ("decoration.blur.contrast", "Contrast", 0.5, 1.5, 0.01, "float"),
+    ]),
+]
+
+
+def read_json(path, default):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return default
+
+
+def lua_literal(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        return ("%.4f" % v).rstrip("0").rstrip(".") if v != int(v) else "%.1f" % v
+    return str(v)
+
+
+def lua_table(values):
+    """{'general.gaps_in': 5, ...} -> nested Lua table text for hl.config."""
+    tree = {}
+    for path, v in values.items():
+        node = tree
+        parts = path.split(".")
+        for p in parts[:-1]:
+            node = node.setdefault(p, {})
+        node[parts[-1]] = v
+
+    def emit(n, ind):
+        out = []
+        for k, v in n.items():
+            if isinstance(v, dict):
+                out.append("%s%s = {\n%s\n%s}," % (ind, k, "\n".join(emit(v, ind + "    ")), ind))
+            else:
+                out.append("%s%s = %s," % (ind, k, lua_literal(v)))
+        return out
+
+    return "{\n" + "\n".join(emit(tree, "    ")) + "\n}"
+
+
+def config_defaults():
+    """Current values: parsed from config.lua, overridden by studio.json."""
+    vals = {}
+    try:
+        text = open(HYPR + "/config.lua").read()
+    except OSError:
+        text = ""
+    for sections in HYPR_SECTIONS:
+        for path, *_ in sections[1]:
+            key = path.split(".")[-1]
+            m = re.search(r"\b%s\s*=\s*(-?[0-9.]+)" % re.escape(key), text)
+            if m:
+                vals[path] = float(m.group(1))
+    vals.update(read_json(STUDIO_JSON, {}))
+    return vals
+
+
+class Studio(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="local.hypr.studio")
+        self.layout = {}
+        self.sel = None  # (zone, index) of the selected bar module
+        self.save_timer = None
+        self.current_file = None
+        self.hypr_vals = {}
+        self.hypr_timer = None
+        self.pending_canvas = None
+
+    # ------------------------------------------------------------------ app skeleton
+    def do_activate(self):
+        self.skin = Skin()
+        self.load_layout()
+        win = Gtk.ApplicationWindow(application=self, title="Hypr Studio", default_width=1280, default_height=820)
+        self.win = win
+        root = Gtk.Box()
+        win.set_child(root)
+
+        nav = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, css_classes=["nav"])
+        nav.set_size_request(190, -1)
+        nav.append(Gtk.Label(label="HYPR STUDIO", xalign=0, css_classes=["title-main"], margin_bottom=10, margin_start=6))
+        self.stack = Gtk.Stack(hexpand=True, vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.navbtn = {}
+        for name, label in (("bar", "󰕮  Bar"), ("widgets", "󰏗  Widgets"), ("panels", "󰖲  Panels"), ("canvas", "󰙲  Canvas"),
+                            ("code", "󰅩  Code"), ("hypr", "󱄄  Hyprland")):
+            b = Gtk.Button(label=label, halign=Gtk.Align.FILL)
+            b.get_child().set_xalign(0)
+            b.connect("clicked", lambda _b, n=name: self.go(n))
+            nav.append(b)
+            self.navbtn[name] = b
+        nav.append(Gtk.Box(vexpand=True))
+        nav.append(Gtk.Label(label="Theme", xalign=0, css_classes=["dim-label"], margin_start=6))
+        themes = Gtk.FlowBox(max_children_per_line=3, selection_mode=Gtk.SelectionMode.NONE, column_spacing=4, row_spacing=4)
+        for t in ("cyan", "magenta", "lime", "amber", "violet"):
+            b = Gtk.Button(label=t, css_classes=["mini"])
+            b.connect("clicked", lambda _b, t=t: subprocess.Popen([HYPR + "/scripts/accent.sh", t]))
+            themes.append(b)
+        nav.append(themes)
+        gb = Gtk.Button(label="󰂵  Glass settings")
+        gb.connect("clicked", lambda *_: subprocess.Popen([HOME + "/.local/bin/hyprglass-gui"]))
+        nav.append(gb)
+        root.append(nav)
+        root.append(self.stack)
+
+        self.stack.add_named(self.build_bar_page(), "bar")
+        self.stack.add_named(self.build_widgets_page(), "widgets")
+        self.stack.add_named(self.build_panels_page(), "panels")
+        self.canvas = panelcanvas.CanvasPage(self)
+        self.stack.add_named(self.canvas, "canvas")
+        self.stack.add_named(self.build_code_page(), "code")
+        self.stack.add_named(self.build_hypr_page(), "hypr")
+        self.go(os.environ.get("STUDIO_PAGE", "bar"))
+        win.present()
+
+    def go(self, name):
+        self.stack.set_visible_child_name(name)
+        for n, b in self.navbtn.items():
+            (b.add_css_class if n == name else b.remove_css_class)("current")
+        if name == "panels":
+            self.refresh_panels()
+        if name == "code":
+            self.refresh_files()
+        if name == "canvas":
+            sel = self.pending_canvas
+            self.pending_canvas = None
+            self.canvas.refresh_names(sel)
+
+    def toast(self, text):
+        self.status.set_text(text)
+
+    # ------------------------------------------------------------------ layout model
+    def load_layout(self):
+        d = read_json(LAYOUT, {})
+        self.layout = {
+            "gap": d.get("gap", 10),
+            "left": d.get("left", [{"type": "workspaces"}, {"type": "elsewhere"}, {"type": "mode"}]),
+            "center": d.get("center", [{"type": "start"}]),
+            "right": d.get("right", [{"type": t} for t in ("tray", "network", "visualizer", "volume", "clock")]),
+            "panels": d.get("panels", []),
+        }
+
+    def save_layout(self, now=False):
+        def write():
+            self.save_timer = None
+            json.dump(self.layout, open(LAYOUT, "w"), indent=2)
+            self.toast("Saved: Quickshell reloads the bar live.")
+            return False
+
+        if self.save_timer:
+            GLib.source_remove(self.save_timer)
+        if now:
+            write()
+        else:
+            self.save_timer = GLib.timeout_add(250, write)
+
+    def module_title(self, cfg):
+        if cfg["type"] in BUILTIN:
+            ic, name, _ = BUILTIN[cfg["type"]]
+            return ic, name
+        kind = cfg.get("kind", "text")
+        label = {"script": cfg.get("command", "")[:34], "clock": "clock " + cfg.get("format", ""),
+                 "text": cfg.get("text", "")}.get(kind, "custom")
+        return cfg.get("icon") or "󰏗", "Custom · " + (label or kind)
+
+    # ------------------------------------------------------------------ Bar page
+    def build_bar_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=16, margin_bottom=12,
+                       margin_start=18, margin_end=18)
+        head = Gtk.Box(spacing=10)
+        head.append(Gtk.Label(label="Bar layout", xalign=0, css_classes=["title-main"], hexpand=True))
+        head.append(Gtk.Label(label="Gap between modules"))
+        self.gap_spin = Gtk.SpinButton.new_with_range(0, 40, 1)
+        self.gap_spin.set_value(self.layout["gap"])
+        self.gap_spin.connect("value-changed", lambda s: (self.layout.__setitem__("gap", int(s.get_value())), self.save_layout()))
+        head.append(self.gap_spin)
+        page.append(head)
+        page.append(Gtk.Label(label="Drag modules between zones, or use the arrows. Changes apply to the real bar instantly.",
+                              xalign=0, css_classes=["dim-label"]))
+
+        # live bar preview strip
+        self.preview = Gtk.Box(spacing=0, css_classes=["zone"], margin_top=4)
+        page.append(self.preview)
+
+        cols = Gtk.Box(spacing=12, homogeneous=True, vexpand=True)
+        self.lists = {}
+        for z in ZONES:
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, css_classes=["zone"])
+            card.append(Gtk.Label(label=z.upper(), xalign=0, css_classes=["zone-title"]))
+            lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, vexpand=True)
+            lb.zone = z
+            dt = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+            dt.connect("drop", self.on_drop, z, None)
+            lb.add_controller(dt)
+            sw = Gtk.ScrolledWindow(child=lb, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            card.append(sw)
+            add = Gtk.MenuButton(label="+ Add built-in")
+            add.set_create_popup_func(lambda mb, z=z: self.fill_add_menu(mb, z))
+            card.append(add)
+            cols.append(card)
+            self.lists[z] = lb
+        page.append(cols)
+
+        self.props_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["zone"])
+        page.append(self.props_box)
+        self.status = Gtk.Label(label="Ready.", xalign=0, css_classes=["status"])
+        page.append(self.status)
+        self.rebuild_bar()
+        return page
+
+    def fill_add_menu(self, mb, zone):
+        used = {m["type"] for z in ZONES for m in self.layout[z]}
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        missing = [t for t in BUILTIN if t not in used]
+        if not missing:
+            box.append(Gtk.Label(label="All built-in modules are already on the bar.", margin_start=8, margin_end=8))
+        for t in missing:
+            b = Gtk.Button(label="%s  %s" % (BUILTIN[t][0], BUILTIN[t][1]), has_frame=False)
+            b.get_child().set_xalign(0)
+            b.connect("clicked", lambda _b, t=t: (pop.popdown(), self.add_module(zone, {"type": t})))
+            box.append(b)
+        pop.set_child(box)
+        mb.set_popover(pop)
+
+    def add_module(self, zone, cfg):
+        self.layout[zone].append(cfg)
+        self.sel = (zone, len(self.layout[zone]) - 1)
+        self.rebuild_bar()
+        self.save_layout()
+
+    def rebuild_bar(self):
+        for z, lb in self.lists.items():
+            while (r := lb.get_first_child()):
+                lb.remove(r)
+            for i, cfg in enumerate(self.layout[z]):
+                lb.append(self.make_row(z, i, cfg))
+        # strip preview
+        while (c := self.preview.get_first_child()):
+            self.preview.remove(c)
+        for z in ZONES:
+            box = Gtk.Box(spacing=6, hexpand=True, halign={"left": Gtk.Align.START, "center": Gtk.Align.CENTER,
+                                                           "right": Gtk.Align.END}[z])
+            for i, cfg in enumerate(self.layout[z]):
+                ic, name = self.module_title(cfg)
+                lab = Gtk.Label(label=ic + " " + (name if cfg["type"] != "workspaces" else "1 2 3 4"),
+                                css_classes=["chip"] + (["selected"] if self.sel == (z, i) else []),
+                                tooltip_text="Drag to reorder or move to another zone")
+                lab.set_opacity(0.35 if cfg.get("hidden") else 1)
+                lab.set_cursor(Gdk.Cursor.new_from_name("grab"))
+                src = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+                src.connect("prepare", lambda s, x, y, z=z, i=i: Gdk.ContentProvider.new_for_value(GObject.Value(str, "%s|%d" % (z, i))))
+                src.connect("drag-begin", lambda s, d, lab=lab: s.set_icon(Gtk.WidgetPaintable.new(lab), 10, 10))
+                lab.add_controller(src)
+                dt = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+                dt.connect("drop", self.on_drop, z, i)
+                lab.add_controller(dt)
+                click = Gtk.GestureClick()
+                click.connect("released", lambda *_a, z=z, i=i: self.select(z, i))
+                lab.add_controller(click)
+                box.append(lab)
+            # dropping on the empty part of a zone appends to it
+            zdt = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+            zdt.connect("drop", self.on_drop, z, None)
+            box.add_controller(zdt)
+            box.set_size_request(60, -1)
+            self.preview.append(box)
+        self.rebuild_props()
+
+    def make_row(self, zone, idx, cfg):
+        ic, name = self.module_title(cfg)
+        row = Gtk.ListBoxRow(activatable=False)
+        chip = Gtk.Box(spacing=6, css_classes=["chip"] + (["hiddenmod"] if cfg.get("hidden") else []))
+        if self.sel == (zone, idx):
+            chip.add_css_class("selected")
+            chip.add_css_class("chip")
+        chip.append(Gtk.Label(label="⠿", css_classes=["dim-label"]))
+        chip.append(Gtk.Label(label=ic + "  " + name, xalign=0, hexpand=True, ellipsize=3, width_chars=14))
+        for label, tip, fn in (
+            ("▲", "Move up", lambda *_: self.shift(zone, idx, -1)),
+            ("▼", "Move down", lambda *_: self.shift(zone, idx, 1)),
+            ("󰈈" if not cfg.get("hidden") else "󰈉", "Show / hide", lambda *_: self.toggle_hidden(zone, idx)),
+            ("󰆴", "Remove", lambda *_: self.remove(zone, idx)),
+        ):
+            b = Gtk.Button(label=label, has_frame=False, tooltip_text=tip, css_classes=["mini"])
+            b.connect("clicked", fn)
+            chip.append(b)
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: self.select(zone, idx))
+        chip.add_controller(click)
+        src = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+        src.connect("prepare", lambda s, x, y: Gdk.ContentProvider.new_for_value(GObject.Value(str, "%s|%d" % (zone, idx))))
+        chip.add_controller(src)
+        dt = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        dt.connect("drop", self.on_drop, zone, idx)
+        chip.add_controller(dt)
+        row.set_child(chip)
+        return row
+
+    def on_drop(self, target, value, x, y, zone, idx):
+        try:
+            sz, si = value.split("|")
+            si = int(si)
+            mod = self.layout[sz].pop(si)
+        except (ValueError, KeyError, IndexError):
+            return False
+        pos = len(self.layout[zone]) if idx is None else idx
+        if sz == zone and idx is not None and si < idx:
+            pos = idx  # list already shrank by one, so dropping on a later row lands after it
+        self.layout[zone].insert(min(pos, len(self.layout[zone])), mod)
+        self.sel = (zone, min(pos, len(self.layout[zone]) - 1))
+        GLib.idle_add(lambda: (self.rebuild_bar(), False)[1])
+        self.save_layout()
+        return True
+
+    def select(self, zone, idx):
+        self.sel = (zone, idx)
+        self.rebuild_bar()
+
+    def shift(self, zone, idx, d):
+        lst = self.layout[zone]
+        j = idx + d
+        if 0 <= j < len(lst):
+            lst[idx], lst[j] = lst[j], lst[idx]
+            self.sel = (zone, j)
+            self.rebuild_bar()
+            self.save_layout()
+
+    def move_zone(self, zone, idx, d):
+        j = ZONES.index(zone) + d
+        if 0 <= j < 3:
+            mod = self.layout[zone].pop(idx)
+            self.layout[ZONES[j]].append(mod)
+            self.sel = (ZONES[j], len(self.layout[ZONES[j]]) - 1)
+            self.rebuild_bar()
+            self.save_layout()
+
+    def toggle_hidden(self, zone, idx):
+        m = self.layout[zone][idx]
+        m["hidden"] = not m.get("hidden", False)
+        if not m["hidden"]:
+            m.pop("hidden")
+        self.rebuild_bar()
+        self.save_layout()
+
+    def remove(self, zone, idx):
+        self.layout[zone].pop(idx)
+        self.sel = None
+        self.rebuild_bar()
+        self.save_layout()
+
+    def rebuild_props(self):
+        while (c := self.props_box.get_first_child()):
+            self.props_box.remove(c)
+        if not self.sel or self.sel[1] >= len(self.layout[self.sel[0]]):
+            self.props_box.append(Gtk.Label(label="Select a module to edit its properties.", xalign=0,
+                                            css_classes=["dim-label"]))
+            return
+        zone, idx = self.sel
+        cfg = self.layout[zone][idx]
+        ic, name = self.module_title(cfg)
+        top = Gtk.Box(spacing=6)
+        top.append(Gtk.Label(label="%s  %s" % (ic, name), xalign=0, hexpand=True, css_classes=["zone-title"]))
+        top.append(Gtk.Label(label="Move to", css_classes=["dim-label"]))
+        for zi, zn in enumerate(ZONES):
+            mb = Gtk.Button(label=zn, css_classes=["mini"], sensitive=zn != zone)
+            mb.connect("clicked", lambda _b, zi=zi: self.move_zone(zone, idx, zi - ZONES.index(zone)))
+            top.append(mb)
+        self.props_box.append(top)
+        if cfg["type"] != "custom":
+            self.props_box.append(Gtk.Label(label=BUILTIN[cfg["type"]][2], xalign=0, css_classes=["dim-label"]))
+            return
+        grid = Gtk.Grid(row_spacing=6, column_spacing=10)
+        self.props_box.append(grid)
+
+        def entry(r, label, key, placeholder="", wide=True):
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, r, 1, 1)
+            e = Gtk.Entry(text=str(cfg.get(key, "")), placeholder_text=placeholder, hexpand=wide)
+            e.connect("changed", lambda w: self.set_prop(cfg, key, w.get_text()))
+            grid.attach(e, 1, r, 3, 1)
+
+        grid.attach(Gtk.Label(label="Kind", xalign=0), 0, 0, 1, 1)
+        kinds = Gtk.DropDown.new_from_strings(["text", "script", "clock"])
+        kinds.set_selected(["text", "script", "clock"].index(cfg.get("kind", "text")))
+        kinds.connect("notify::selected", lambda d, _p: (cfg.__setitem__("kind", ["text", "script", "clock"][d.get_selected()]),
+                                                          self.rebuild_bar(), self.save_layout()))
+        grid.attach(kinds, 1, 0, 1, 1)
+        grid.attach(Gtk.Label(label="Accent pill", xalign=0), 2, 0, 1, 1)
+        sw = Gtk.Switch(active=bool(cfg.get("accent")), halign=Gtk.Align.START, valign=Gtk.Align.CENTER)
+        sw.connect("notify::active", lambda s, _p: (cfg.__setitem__("accent", s.get_active()), self.save_layout()))
+        grid.attach(sw, 3, 0, 1, 1)
+        entry(1, "Icon (nerd font glyph)", "icon", "")
+        kind = cfg.get("kind", "text")
+        if kind == "text":
+            entry(2, "Text", "text")
+        elif kind == "script":
+            entry(2, "Command (stdout is shown)", "command", "sensors | ...")
+            grid.attach(Gtk.Label(label="Refresh every (s)", xalign=0), 0, 3, 1, 1)
+            sp = Gtk.SpinButton.new_with_range(1, 3600, 1)
+            sp.set_value(cfg.get("interval", 5))
+            sp.connect("value-changed", lambda s: (cfg.__setitem__("interval", int(s.get_value())), self.save_layout()))
+            grid.attach(sp, 1, 3, 1, 1)
+        else:
+            entry(2, "Format (Qt: HH:mm, ddd d MMM)", "format", "HH:mm")
+        entry(4, "Icon colour (accent, text or #hex)", "color", "accent")
+        entry(5, "On click (shell command)", "click", "kitty")
+
+    def set_prop(self, cfg, key, val):
+        if val == "":
+            cfg.pop(key, None)
+        else:
+            cfg[key] = val
+        self.rebuild_bar_light()
+        self.save_layout()
+
+    def rebuild_bar_light(self):
+        """Refresh list titles without rebuilding the property form (keeps the entry focus while typing)."""
+        sel = self.sel
+        for z, lb in self.lists.items():
+            r = lb.get_first_child()
+            i = 0
+            while r:
+                chip = r.get_child()
+                lab = chip.get_first_child().get_next_sibling()
+                ic, name = self.module_title(self.layout[z][i])
+                lab.set_text(ic + "  " + name)
+                r = r.get_next_sibling()
+                i += 1
+
+    # ------------------------------------------------------------------ Widgets page
+    def build_widgets_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=16, margin_bottom=12,
+                       margin_start=18, margin_end=18)
+        page.append(Gtk.Label(label="Widget library", xalign=0, css_classes=["title-main"]))
+        page.append(Gtk.Label(label="Templates for bar modules. Add one to a zone, then fine-tune it on the Bar page.",
+                              xalign=0, css_classes=["dim-label"]))
+        fb = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, min_children_per_line=2, max_children_per_line=4,
+                         row_spacing=12, column_spacing=12, valign=Gtk.Align.START)
+        for t in WIDGET_TEMPLATES:
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
+            card.append(Gtk.Label(label="%s  %s" % (t["icon"], t["name"]), xalign=0, css_classes=["card-title"]))
+            card.append(Gtk.Label(label=t["desc"], xalign=0, wrap=True, css_classes=["dim-label"]))
+            btns = Gtk.Box(spacing=6)
+            for z in ZONES:
+                b = Gtk.Button(label="+ " + z)
+                b.connect("clicked", lambda _b, t=t, z=z: self.add_template(t, z))
+                btns.append(b)
+            card.append(btns)
+            fb.append(card)
+        page.append(Gtk.ScrolledWindow(child=fb, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+        return page
+
+    def add_template(self, t, zone):
+        self.add_module(zone, json.loads(json.dumps(t["cfg"])))
+        self.go("bar")
+
+    # ------------------------------------------------------------------ Panels page
+    def build_panels_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=16, margin_bottom=12,
+                       margin_start=18, margin_end=18)
+        page.append(Gtk.Label(label="Panels & popups", xalign=0, css_classes=["title-main"]))
+        page.append(Gtk.Label(label="Each panel is a QML file in ~/.config/quickshell/user/. Create one from a template, "
+                                    "then edit it live in the Code page.", xalign=0, css_classes=["dim-label"]))
+        new = Gtk.Box(spacing=8)
+        self.panel_tpl = Gtk.DropDown.new_from_strings(list(PANEL_TEMPLATES))
+        new.append(self.panel_tpl)
+        self.panel_name = Gtk.Entry(placeholder_text="file name (optional)", hexpand=True)
+        new.append(self.panel_name)
+        b = Gtk.Button(label="Create panel", css_classes=["suggested-action"])
+        b.connect("clicked", self.create_panel)
+        new.append(b)
+        page.append(new)
+        self.panel_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        page.append(Gtk.ScrolledWindow(child=self.panel_list, vexpand=True))
+        return page
+
+    def refresh_panels(self):
+        while (r := self.panel_list.get_first_child()):
+            self.panel_list.remove(r)
+        os.makedirs(USER_DIR, exist_ok=True)
+        registered = {p["file"]: p for p in self.layout["panels"]}
+        files = sorted(d + "/main.qml" for d in os.listdir(USER_DIR)
+                       if not d.startswith(".") and os.path.isfile(USER_DIR + "/" + d + "/main.qml"))
+        for f in files:
+            p = registered.get(f)
+            chip = Gtk.Box(spacing=8, css_classes=["chip"], margin_bottom=6)
+            chip.append(Gtk.Label(label="󰖲  " + f, xalign=0, hexpand=True))
+            chip.append(Gtk.Label(label="enabled" if p and p.get("enabled", True) else "off", css_classes=["dim-label"]))
+            sw = Gtk.Switch(active=bool(p and p.get("enabled", True)), valign=Gtk.Align.CENTER)
+            sw.connect("notify::active", lambda s, _p, f=f: self.set_panel_enabled(f, s.get_active()))
+            chip.append(sw)
+            if os.path.exists(USER_DIR + "/" + f.split("/")[0] + ".panel.json"):
+                cb = Gtk.Button(label="Design", css_classes=["suggested-action"])
+                cb.connect("clicked", lambda _b, f=f: self.open_canvas(f.split("/")[0]))
+                chip.append(cb)
+            eb = Gtk.Button(label="Code")
+            eb.connect("clicked", lambda _b, f=f: self.open_in_code(USER_DIR + "/" + f))
+            chip.append(eb)
+            db = Gtk.Button(label="󰆴", tooltip_text="Remove (file is kept as .removed)")
+            db.connect("clicked", lambda _b, f=f: self.remove_panel(f))
+            chip.append(db)
+            self.panel_list.append(chip)
+        if not files:
+            self.panel_list.append(Gtk.Label(label="No panels yet.", xalign=0, css_classes=["dim-label"]))
+
+    def create_panel(self, *_):
+        tpl = list(PANEL_TEMPLATES)[self.panel_tpl.get_selected()]
+        base, src = PANEL_TEMPLATES[tpl]
+        name = re.sub(r"[^a-zA-Z0-9_-]", "-", self.panel_name.get_text().strip()) or base
+        os.makedirs(USER_DIR, exist_ok=True)
+        d, n = name, 2
+        while os.path.exists(USER_DIR + "/" + d):
+            d = "%s-%d" % (name, n)
+            n += 1
+        os.makedirs(USER_DIR + "/" + d)
+        fn = d + "/main.qml"
+        open(USER_DIR + "/" + fn, "w").write(src)
+        self.layout["panels"].append({"file": fn, "enabled": True})
+        self.save_layout(now=True)
+        self.panel_name.set_text("")
+        self.refresh_panels()
+        self.open_in_code(USER_DIR + "/" + fn)
+
+    def register_panel(self, fn):
+        """Called by the canvas editor after it writes <fn>: make sure the shell loads it."""
+        if not any(p["file"] == fn for p in self.layout["panels"]):
+            self.layout["panels"].append({"file": fn, "enabled": True})
+            self.save_layout(now=True)
+
+    def unregister_panel(self, fn):
+        before = len(self.layout["panels"])
+        self.layout["panels"] = [p for p in self.layout["panels"] if p["file"] != fn]
+        if len(self.layout["panels"]) != before:
+            self.save_layout(now=True)
+
+    def open_canvas(self, name):
+        self.pending_canvas = name
+        self.go("canvas")
+
+    def set_panel_enabled(self, f, on):
+        for p in self.layout["panels"]:
+            if p["file"] == f:
+                p["enabled"] = on
+                break
+        else:
+            self.layout["panels"].append({"file": f, "enabled": on})
+        self.save_layout(now=True)
+
+    def remove_panel(self, f):
+        self.layout["panels"] = [p for p in self.layout["panels"] if p["file"] != f]
+        self.save_layout(now=True)
+        panelcanvas.trash(USER_DIR + "/" + f.split("/")[0])
+        self.refresh_panels()
+
+    # ------------------------------------------------------------------ Code page
+    def build_code_page(self):
+        page = Gtk.Box(spacing=12, margin_top=16, margin_bottom=12, margin_start=18, margin_end=18)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        side.set_size_request(230, -1)
+        side.append(Gtk.Label(label="Files", xalign=0, css_classes=["zone-title"]))
+        self.file_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.file_list.connect("row-activated", lambda lb, row: self.open_in_code(row.path))
+        side.append(Gtk.ScrolledWindow(child=self.file_list, vexpand=True))
+        page.append(side)
+
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, hexpand=True)
+        bar = Gtk.Box(spacing=8)
+        self.code_title = Gtk.Label(label="No file open", xalign=0, hexpand=True, css_classes=["title-main"])
+        bar.append(self.code_title)
+        bar.append(Gtk.Label(label="Live apply"))
+        self.live_sw = Gtk.Switch(active=True, valign=Gtk.Align.CENTER)
+        bar.append(self.live_sw)
+        sb = Gtk.Button(label="Save", css_classes=["suggested-action"])
+        sb.connect("clicked", lambda *_: self.save_code())
+        bar.append(sb)
+        main.append(bar)
+        self.buf = GtkSource.Buffer()
+        lm = GtkSource.LanguageManager.get_default()
+        self.lm = lm
+        sm = GtkSource.StyleSchemeManager.get_default()
+        self.buf.set_style_scheme(sm.get_scheme("Adwaita-dark"))
+        self.view = GtkSource.View(buffer=self.buf, show_line_numbers=True, auto_indent=True, indent_width=4,
+                                   insert_spaces_instead_of_tabs=True, highlight_current_line=True, monospace=True,
+                                   top_margin=8, bottom_margin=8, left_margin=8)
+        self.buf.connect("changed", self.on_code_changed)
+        self.code_timer = None
+        self.loading_code = False
+        wrap = Gtk.ScrolledWindow(child=self.view, vexpand=True, css_classes=["editor-wrap"])
+        main.append(wrap)
+        self.console = Gtk.Label(label="Console: Quickshell / Hyprland errors show here after each apply.", xalign=0,
+                                 yalign=0, wrap=True, selectable=True, css_classes=["console"])
+        self.console.set_size_request(-1, 110)
+        main.append(self.console)
+        page.append(main)
+        return page
+
+    def code_files(self):
+        out = []
+        if os.path.isdir(USER_DIR):
+            out += [("user/%s/main.qml" % d, USER_DIR + "/%s/main.qml" % d) for d in sorted(os.listdir(USER_DIR))
+                    if not d.startswith(".") and os.path.isfile(USER_DIR + "/%s/main.qml" % d)]
+        out += [("quickshell/layout.json", LAYOUT)]
+        out += [("quickshell/" + f, QS + "/" + f) for f in sorted(os.listdir(QS)) if f.endswith(".qml")]
+        out += [("hypr/" + f, HYPR + "/" + f) for f in sorted(os.listdir(HYPR)) if f.endswith(".lua")]
+        return out
+
+    def refresh_files(self):
+        while (r := self.file_list.get_first_child()):
+            self.file_list.remove(r)
+        for label, path in self.code_files():
+            row = Gtk.ListBoxRow()
+            row.path = path
+            row.set_child(Gtk.Label(label=label, xalign=0, margin_top=4, margin_bottom=4, margin_start=6))
+            self.file_list.append(row)
+
+    def open_in_code(self, path):
+        self.go("code")
+        self.current_file = path
+        self.loading_code = True
+        try:
+            self.buf.set_text(open(path).read())
+        except OSError as e:
+            self.buf.set_text("// cannot open: %s" % e)
+        self.loading_code = False
+        ext = os.path.splitext(path)[1]
+        self.buf.set_language(self.lm.get_language({".lua": "lua", ".json": "json", ".qml": "js"}.get(ext, "js")))
+        self.code_title.set_text(os.path.relpath(path, HOME))
+        self.console.set_text("Opened %s" % os.path.relpath(path, HOME))
+
+    def on_code_changed(self, *_):
+        if self.loading_code or not self.current_file or not self.live_sw.get_active():
+            return
+        if self.code_timer:
+            GLib.source_remove(self.code_timer)
+        self.code_timer = GLib.timeout_add(700, lambda: (self.save_code(), False)[1])
+
+    def save_code(self):
+        self.code_timer = None
+        if not self.current_file:
+            return
+        text = self.buf.get_text(self.buf.get_start_iter(), self.buf.get_end_iter(), False)
+        open(self.current_file, "w").write(text)
+        if self.current_file.endswith(".lua"):
+            subprocess.run(["hyprctl", "reload"], capture_output=True)
+            GLib.timeout_add(500, self.show_hypr_errors)
+        else:
+            GLib.timeout_add(900, self.show_qs_errors)
+
+    def show_hypr_errors(self):
+        r = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True).stdout.strip()
+        self.console.set_text("Hyprland reloaded.\n" + (r or "No config errors."))
+        return False
+
+    def show_qs_errors(self):
+        try:
+            log = subprocess.run(["quickshell", "log"], capture_output=True, text=True, timeout=4).stdout
+        except subprocess.TimeoutExpired:
+            log = ""
+        lines = [re.sub(r"\x1b\[[0-9;]*m", "", l) for l in log.splitlines()]
+        bad = [l for l in lines if re.search(r"ERROR|user panel|user/|layout|Type .* unavailable|is not a type", l)
+               and "qt.svg" not in l][-8:]
+        self.console.set_text("Saved. Quickshell reloaded the file.\n" + ("\n".join(bad) if bad else "No errors."))
+        return False
+
+    # ------------------------------------------------------------------ Hyprland page
+    def build_hypr_page(self):
+        self.hypr_vals = config_defaults()
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=16, margin_bottom=12,
+                        margin_start=18, margin_end=18)
+        head = Gtk.Box(spacing=8)
+        head.append(Gtk.Label(label="Hyprland", xalign=0, css_classes=["title-main"], hexpand=True))
+        for label, fn in (("Open config in Code", lambda *_: self.open_in_code(HYPR + "/config.lua")),
+                          ("Reset to config.lua", self.hypr_reset), ("Save permanently", self.hypr_save)):
+            b = Gtk.Button(label=label, css_classes=["mini"] + (["suggested-action"] if label.startswith("Save") else []))
+            b.connect("clicked", fn)
+            head.append(b)
+        outer.append(head)
+        self.hypr_status = Gtk.Label(label="Sliders apply live. 'Save permanently' writes ~/.config/hypr/studio.lua.",
+                                     xalign=0, css_classes=["dim-label"])
+        outer.append(self.hypr_status)
+        body = Gtk.Box(spacing=14, vexpand=True)
+        outer.append(body)
+
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, hexpand=True)
+        self.adjs = {}
+        for title, items in HYPR_SECTIONS:
+            exp = Gtk.Expander(label=title, expanded=True)
+            grid = Gtk.Grid(row_spacing=2, column_spacing=10, margin_top=6)
+            for r, (path, label, lo, hi, step, kind) in enumerate(items):
+                grid.attach(Gtk.Label(label=label, xalign=0, width_chars=24), 0, r, 1, 1)
+                cur = self.hypr_vals.get(path, lo)
+                adj = Gtk.Adjustment(value=cur, lower=lo, upper=hi, step_increment=step)
+                sc = Gtk.Scale(adjustment=adj, hexpand=True, draw_value=False)
+                sp = Gtk.SpinButton(adjustment=adj, digits=0 if kind == "int" else 2, width_chars=6)
+                grid.attach(sc, 1, r, 1, 1)
+                grid.attach(sp, 2, r, 1, 1)
+                adj.connect("value-changed", lambda a, p=path, k=kind: self.hypr_changed(p, a.get_value(), k))
+                self.adjs[path] = adj
+            exp.set_child(grid)
+            left.append(exp)
+        body.append(Gtk.ScrolledWindow(child=left, hexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["zone"])
+        right.set_size_request(380, -1)
+        right.append(Gtk.Label(label="KEYBINDS", xalign=0, css_classes=["zone-title"]))
+        self.bind_search = Gtk.SearchEntry(placeholder_text="filter binds")
+        self.bind_search.connect("search-changed", lambda *_: self.fill_binds())
+        right.append(self.bind_search)
+        self.bind_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        right.append(Gtk.ScrolledWindow(child=self.bind_list, vexpand=True))
+        bb = Gtk.Button(label="Open binds.lua in Code")
+        bb.connect("clicked", lambda *_: self.open_in_code(HYPR + "/binds.lua"))
+        right.append(bb)
+        body.append(right)
+        self.binds = []
+        GLib.idle_add(self.load_binds)
+        return outer
+
+    def load_binds(self):
+        """Keybinds come from binds.lua: in Lua mode hyprctl only reports opaque __lua callbacks."""
+        self.binds = []
+        try:
+            lines = open(HYPR + "/binds.lua").read().splitlines()
+        except OSError:
+            lines = []
+        for ln in lines:
+            m = re.match(r"\s*hl\.bind\((.*?),\s*(hl\.dsp.*|function.*)\)\s*(--.*)?$", ln)
+            if not m:
+                continue
+            combo = re.sub(r'mainMod\s*\.\.\s*"\s*\+?\s*', "SUPER + ", m.group(1)).replace('"', "").strip()
+            combo = re.sub(r"\s*\+\s*", "+", combo).replace("SUPER+", "Super+")
+            self.binds.append({"combo": combo, "action": re.sub(r"^hl\.dsp\.", "", m.group(2)), "note": (m.group(3) or "").lstrip("- ")})
+        self.fill_binds()
+
+    def fill_binds(self):
+        while (r := self.bind_list.get_first_child()):
+            self.bind_list.remove(r)
+        q = self.bind_search.get_text().lower()
+        for b in self.binds:
+            text = b["combo"] + " " + b["action"] + " " + b["note"]
+            if q and q not in text.lower():
+                continue
+            row = Gtk.Box(spacing=8, margin_bottom=2)
+            row.append(Gtk.Label(label=b["combo"], xalign=0, width_chars=16, css_classes=["card-title"]))
+            row.append(Gtk.Label(label=(b["note"] or b["action"])[:48], xalign=0, hexpand=True, ellipsize=3,
+                                 css_classes=["dim-label"], tooltip_text=b["action"]))
+            self.bind_list.append(row)
+
+    def hypr_changed(self, path, v, kind):
+        v = int(round(v)) if kind == "int" else round(v, 3)
+        self.hypr_vals[path] = v
+        if self.hypr_timer:
+            GLib.source_remove(self.hypr_timer)
+        self.hypr_timer = GLib.timeout_add(120, lambda: self.hypr_apply(path, v))
+
+    def hypr_apply(self, path, v):
+        self.hypr_timer = None
+        subprocess.run(["hyprctl", "eval", "hl.config(%s)" % lua_table({path: v}).replace("\n", " ")], capture_output=True)
+        return False
+
+    def hypr_save(self, *_):
+        json.dump(self.hypr_vals, open(STUDIO_JSON, "w"), indent=2)
+        open(STUDIO_LUA, "w").write("-- Written by Hypr Studio (hypr-studio > Hyprland > Save permanently). Loaded last.\n"
+                                    "hl.config(%s)\n" % lua_table(self.hypr_vals))
+        main = open(HYPR + "/hyprland.lua").read()
+        if 'require("studio")' not in main:
+            open(HYPR + "/hyprland.lua", "w").write(main.rstrip("\n") + '\nrequire("studio")\n')
+        self.hypr_status.set_text("Saved to studio.lua.")
+
+    def hypr_reset(self, *_):
+        for f in (STUDIO_JSON,):
+            if os.path.exists(f):
+                os.remove(f)
+        if os.path.exists(STUDIO_LUA):
+            open(STUDIO_LUA, "w").write("-- Hypr Studio overrides: none\n")
+        subprocess.run(["hyprctl", "reload"], capture_output=True)
+        vals = config_defaults()
+        self.hypr_vals = vals
+        for p, adj in self.adjs.items():
+            if p in vals:
+                adj.set_value(vals[p])
+        self.hypr_status.set_text("Reset to config.lua.")
+
+
+if __name__ == "__main__":
+    Studio().run()

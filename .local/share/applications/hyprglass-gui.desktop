@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=HyprGlass Settings
+Comment=Live-tune HyprGlass
+Exec=/home/elia1995/.local/bin/hyprglass-gui
+Icon=preferences-desktop-theme
+Categories=Settings;

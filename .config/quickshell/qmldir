@@ -1,0 +1,14 @@
+module quickshell
+singleton Theme 1.0 Theme.qml
+AurPackagePage 1.0 AurPackagePage.qml
+HudDecoration 1.0 HudDecoration.qml
+NeonButton 1.0 NeonButton.qml
+NeonPanel 1.0 NeonPanel.qml
+NeonSeparator 1.0 NeonSeparator.qml
+SidebarSections 1.0 SidebarSections.qml
+SidebarShortcutEditor 1.0 SidebarShortcutEditor.qml
+TrayMenuRow 1.0 TrayMenuRow.qml
+PowerButton 1.0 PowerButton.qml
+GlassPill 1.0 GlassPill.qml
+CustomModule 1.0 CustomModule.qml
+BarSlot 1.0 BarSlot.qml

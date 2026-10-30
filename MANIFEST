@@ -1,0 +1,22 @@
+# Files that make up Hypr Studio + HyprGlass settings, relative to $HOME. Globs allowed.
+.local/bin/hypr-studio
+.local/bin/hyprglass-gui
+.local/lib/panelcanvas.py
+.local/lib/neonskin.py
+.local/share/applications/hypr-studio.desktop
+.local/share/applications/hyprglass-gui.desktop
+.config/quickshell/shell.qml
+.config/quickshell/qmldir
+.config/quickshell/BarSlot.qml
+.config/quickshell/CustomModule.qml
+.config/quickshell/GlassPill.qml
+.config/quickshell/layout.json
+.config/quickshell/user/*/main.qml
+.config/quickshell/user/*.panel.json
+.config/hypr/glass.lua
+.config/hypr/glass-gui-presets.json
+.config/hypr/studio.lua
+.config/hypr/studio.json
+.config/hypr/binds.lua
+.config/hypr/hyprland.lua
+.config/hypr/autostart.lua

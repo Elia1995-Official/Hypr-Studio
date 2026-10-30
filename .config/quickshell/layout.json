@@ -1,0 +1,55 @@
+{
+  "gap": 10,
+  "left": [
+    {
+      "type": "workspaces"
+    },
+    {
+      "type": "elsewhere"
+    },
+    {
+      "type": "mode"
+    }
+  ],
+  "center": [
+    {
+      "type": "start"
+    }
+  ],
+  "right": [
+    {
+      "type": "tray"
+    },
+    {
+      "type": "visualizer"
+    },
+    {
+      "type": "volume"
+    },
+    {
+      "type": "network",
+      "hidden": true
+    },
+    {
+      "type": "custom",
+      "kind": "script",
+      "icon": "\udb82\udcae",
+      "interval": 4,
+      "color": "accent",
+      "command": "nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader | sed 's/$/\u00b0C/'"
+    },
+    {
+      "type": "clock"
+    }
+  ],
+  "panels": [
+    {
+      "file": "showcase/main.qml",
+      "enabled": true
+    },
+    {
+      "file": "Test/main.qml",
+      "enabled": true
+    }
+  ]
+}

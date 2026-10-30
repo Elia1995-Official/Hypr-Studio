@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Hypr Studio
+Comment=Visual editor for the Quickshell bar, widgets, panels and the Hyprland config
+Exec=/home/elia1995/.local/bin/hypr-studio
+Icon=preferences-desktop
+Categories=Settings;
