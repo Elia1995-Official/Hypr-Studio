@@ -617,6 +617,7 @@ class CanvasPage(Gtk.Box):
             self.draw_item(cr, it, pad, z)
         # panel resize handles (outside the item handles' colour so they read as "the canvas")
         for hx, hy in HANDLES:
+            cr.new_path()  # draw_item can leave a dangling current point -> stray line to the first handle
             cr.arc(pad + hx * W, pad + hy * H, 5, 0, 2 * math.pi)
             cr.set_source_rgb(0.02, 0.04, 0.06)
             cr.fill_preserve()
@@ -676,9 +677,11 @@ class CanvasPage(Gtk.Box):
 
     @staticmethod
     def qt_format(dt, fmt):
-        for q, p in (("dddd", "%A"), ("ddd", "%a"), ("MMMM", "%B"), ("MMM", "%b"), ("yyyy", "%Y"), ("HH", "%H"), ("mm", "%M"),
-                     ("ss", "%S"), ("dd", "%d")):
-            fmt = fmt.replace(q, p)
+        import re
+        m = {"dddd": "%A", "ddd": "%a", "dd": "%d", "d": str(dt.day), "MMMM": "%B", "MMM": "%b", "yyyy": "%Y",
+             "HH": "%H", "mm": "%M", "ss": "%S"}
+        # single pass so the output of one token is never re-matched by another
+        fmt = re.sub(r"dddd|ddd|dd|d|MMMM|MMM|yyyy|HH|mm|ss", lambda x: m[x.group(0)], fmt)
         try:
             return dt.strftime(fmt)
         except ValueError:
