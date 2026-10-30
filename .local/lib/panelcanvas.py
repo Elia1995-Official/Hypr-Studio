@@ -366,6 +366,9 @@ class CanvasPage(Gtk.Box):
 
         top = Gtk.Box(spacing=8)
         top.append(Gtk.Label(label="Canvas", xalign=0, css_classes=["title-main"]))
+        self.tg_left = Gtk.ToggleButton(label="◧", tooltip_text="Show / hide the toolbox and layers", active=True, css_classes=["mini"])
+        self.tg_right = Gtk.ToggleButton(label="◨", tooltip_text="Show / hide the properties", active=True, css_classes=["mini"])
+        top.append(self.tg_left)
         self.names = Gtk.StringList()
         self.picker = Gtk.DropDown(model=self.names)
         self.picker.connect("notify::selected", lambda *_: self.on_pick())
@@ -379,6 +382,7 @@ class CanvasPage(Gtk.Box):
         self.del_btn.connect("clicked", self.on_delete)
         top.append(self.del_btn)
         top.append(Gtk.Box(hexpand=True))
+        top.append(self.tg_right)
         for label, tip, fn in (("↶", "Undo (Ctrl+Z)", lambda *_: self.undo()), ("↷", "Redo (Ctrl+Shift+Z)", lambda *_: self.redo())):
             ub = Gtk.Button(label=label, tooltip_text=tip, css_classes=["mini"])
             ub.connect("clicked", fn)
@@ -428,7 +432,9 @@ class CanvasPage(Gtk.Box):
             b.connect("clicked", fn)
             lb.append(b)
         left.append(lb)
-        body.append(left)
+        left_rev = Gtk.Revealer(child=left, reveal_child=True, transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT)
+        self.tg_left.connect("toggled", lambda b: left_rev.set_reveal_child(b.get_active()))
+        body.append(left_rev)
 
         # canvas
         self.area = Gtk.DrawingArea(focusable=True, can_focus=True)
@@ -451,8 +457,11 @@ class CanvasPage(Gtk.Box):
         self.props = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["zone"])
         self.props.set_size_request(330, -1)
         # hexpand=False: the entries inside the props are hexpand and would otherwise split the width 50/50 with the canvas
-        body.append(Gtk.ScrolledWindow(child=self.props, hscrollbar_policy=Gtk.PolicyType.NEVER, hexpand=False,
-                                       min_content_width=330, max_content_width=420, propagate_natural_width=True))
+        props_rev = Gtk.Revealer(reveal_child=True, transition_type=Gtk.RevealerTransitionType.SLIDE_LEFT, child=Gtk.ScrolledWindow(
+            child=self.props, hscrollbar_policy=Gtk.PolicyType.NEVER, hexpand=False, min_content_width=330, max_content_width=420,
+            propagate_natural_width=True))
+        self.tg_right.connect("toggled", lambda b: props_rev.set_reveal_child(b.get_active()))
+        body.append(props_rev)
 
         self.refresh_names()
 

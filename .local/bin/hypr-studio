@@ -361,7 +361,16 @@ class Studio(Gtk.Application):
         gb = Gtk.Button(label="󰂵  Glass settings")
         gb.connect("clicked", lambda *_: subprocess.Popen([HOME + "/.local/bin/hyprglass-gui"]))
         nav.append(gb)
-        root.append(nav)
+        nav_rev = Gtk.Revealer(child=nav, reveal_child=True, transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT)
+        nav_tg = Gtk.Button(label="‹", tooltip_text="Collapse / expand the sidebar", css_classes=["mini"], valign=Gtk.Align.CENTER, margin_start=2, margin_end=2)
+
+        def toggle_nav(_b):
+            show = not nav_rev.get_reveal_child()
+            nav_rev.set_reveal_child(show)
+            nav_tg.set_label("‹" if show else "›")
+        nav_tg.connect("clicked", toggle_nav)
+        root.append(nav_rev)
+        root.append(nav_tg)
         root.append(self.stack)
 
         self.stack.add_named(self.build_bar_page(), "bar")
